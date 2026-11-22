@@ -41,7 +41,7 @@ Other ways:
 - **Unattended:** the installer takes its answers on the command line:
 
   ```
-  saydrop-0.1.0-setup.exe /VERYSILENT /TASKS="autostart" /ASR=http://server:8020 /HOTKEY=Insert /LLM=http://server:8000 /LLMMODEL=my-model
+  saydrop-<version>-setup.exe /VERYSILENT /TASKS="autostart" /ASR=http://server:8020 /HOTKEY=Insert /LLM=http://server:8000 /LLMMODEL=my-model
   ```
 
 An icon appears in the notification area. Windows 11 tends to tuck new icons
@@ -69,7 +69,8 @@ Right-click the tray icon for the switches:
 - **Copy last result** / **Copy last raw transcript**: the cleanup model edits
   your words, so the unedited transcript is always one click away.
 - **Transcribe last recording again**: if the server was down, nothing is
-  lost; the last recording is kept in memory until the next one.
+  lost; the last recording is kept in memory until the next one. It also
+  sends a recording that was held back as silence.
 - **Microphone**: pick an input device.
 - **Test connection**: checks both servers and shows what they answered.
 
@@ -91,7 +92,7 @@ works. Give its address as `asr_url`; the path is added for you.
 Only the first row is tested regularly; the others use the same API. Reports
 are welcome.
 
-Two things worth knowing:
+Three things worth knowing:
 
 - **Recording length.** Servers accept only so much audio per request, and
   some cut off longer audio *without an error*: you get the first part of your
@@ -100,6 +101,16 @@ Two things worth knowing:
   was said; the bar counts down the last 30 seconds. For llama-server the
   limit is roughly `context size / 16` seconds, so `-c 4096` is a little over
   four minutes.
+- **Silence.** Given a recording with nothing in it, some speech models make
+  text up. That is what happens when Windows records from the wrong
+  microphone, or a muted one. So a recording that never gets louder than
+  `silence_db` (default -50 dB) is not sent at all: you get "No speech heard"
+  with the level that was measured, and nothing is pasted. The meter on the
+  bar follows the same limit, so flat bars while you speak mean the same
+  thing: pick the right input under **Microphone** in the tray menu. If your
+  microphone is simply quiet and real speech gets rejected, lower the value
+  (for example `-60`); **Transcribe last recording again** sends a rejected
+  recording anyway.
 - **Glossary.** Put names and terms in `glossary` and they are sent along as a
   hint, which fixes most misspelled product names and jargon.
 
@@ -157,6 +168,7 @@ asr_url = http://127.0.0.1:8020
 asr_model = whisper-1
 glossary = Kubernetes, kubectl, PostgreSQL
 max_seconds = 240
+silence_db = -50
 
 llm = on
 llm_url = http://127.0.0.1:8000

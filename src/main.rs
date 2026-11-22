@@ -87,8 +87,9 @@ const FAKE_LEVEL_TIMER: usize = 2;
 
 /// Shorter recordings are an accidental double press, not speech.
 const MIN_RECORDING_MS: u64 = 350;
-/// Below this peak the microphone delivered silence: muted or blocked.
-const SILENCE_PEAK: f32 = 0.0005;
+/// Below this level the input delivered nothing at all, not even the faint
+/// noise of a live microphone: it is muted, unplugged or blocked.
+const DEAD_INPUT_DB: f32 = -90.0;
 /// How long to wait for the user to let go of the hotkey before pasting.
 const MODIFIER_WAIT_MS: u32 = 3000;
 
@@ -536,7 +537,7 @@ fn start_recording() {
         }
     };
 
-    let max_seconds = app.config.max_seconds;
+    let (max_seconds, silence_db) = (app.config.max_seconds, app.config.silence_db);
     app.anchor = anchor;
     app.state = State::Recording {
         recorder,
@@ -560,7 +561,14 @@ fn start_recording() {
     let fake = app.mic_file.is_some();
 
     set_status(Status::Recording);
-    overlay::show(instance, hwnd, anchor, Phase::Recording, max_seconds);
+    overlay::show(
+        instance,
+        hwnd,
+        anchor,
+        Phase::Recording,
+        max_seconds,
+        silence_db,
+    );
     // SAFETY: our own window handle.
     unsafe {
         if max_seconds > 0 {
@@ -616,13 +624,31 @@ fn stop_recording(limit_reached: bool) {
         notify(Kind::Warning, "Too short", "Nothing was sent.");
         return;
     }
-    if audio::peak(&samples) < SILENCE_PEAK {
+    // A muted or wrong microphone delivers near silence, and some speech
+    // models answer silence with invented text. Better to send nothing.
+    let level = audio::speech_level_db(&samples);
+    let silence_db = APP.get().map_or(0.0, |app| app.config.silence_db);
+    log(&format!(
+        "recording: {:.1} s, level {level:.0} dB",
+        samples.len() as f32 / audio::SAMPLE_RATE as f32
+    ));
+    if level < silence_db {
         back_to_idle();
-        log("audio: the recording was silent");
+        // Kept, so "Transcribe last recording again" can send it anyway.
+        if let Some(app) = APP.get() {
+            app.last_audio = Some(Arc::new(samples));
+        }
+        let detail = if level < DEAD_INPUT_DB {
+            "The microphone delivered silence. Is it muted, or the wrong one selected?".to_string()
+        } else {
+            format!(
+                "Loudest sound {level:.0} dB, below the limit of {silence_db:.0} dB. Wrong microphone?"
+            )
+        };
         notify(
-            Kind::Error,
-            "No sound from the microphone",
-            "Check that it is not muted and that Windows lets desktop apps use it.",
+            Kind::Warning,
+            "No speech heard \u{2014} nothing sent",
+            &detail,
         );
         return;
     }
@@ -656,7 +682,7 @@ fn fake_level() {
     let position = (tick().saturating_sub(*started) as usize) * audio::SAMPLE_RATE as usize / 1000;
     let end = position.min(file.len());
     let start = end.saturating_sub(800);
-    overlay::push_level(audio::peak(&file[start..end]));
+    overlay::push_level(audio::level_db(&file[start..end]));
 }
 
 // ---- From recording to text ------------------------------------------------
@@ -675,7 +701,14 @@ fn process(samples: Arc<Vec<i16>>, limit_reached: bool) {
     if overlay::is_visible() {
         overlay::set_phase(Phase::Transcribing);
     } else {
-        overlay::show(instance, hwnd, anchor, Phase::Transcribing, 0);
+        overlay::show(
+            instance,
+            hwnd,
+            anchor,
+            Phase::Transcribing,
+            0,
+            config.silence_db,
+        );
     }
 
     // A window handle is just a number to other threads; posting to it is
@@ -1188,9 +1221,9 @@ unsafe extern "system" fn main_proc(
                     recorder: Some(recorder),
                     ..
                 } = &mut app.state
-                && let Some(peak) = recorder.on_data(lparam as *const WAVEHDR)
+                && let Some(level) = recorder.on_data(lparam as *const WAVEHDR)
             {
-                overlay::push_level(peak);
+                overlay::push_level(level);
             }
             0
         }

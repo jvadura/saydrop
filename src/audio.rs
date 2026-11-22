@@ -143,8 +143,8 @@ impl Recorder {
     }
 
     /// Handle one `MM_WIM_DATA` message (`lparam` is the header pointer).
-    /// Returns the peak level of the new audio, 0.0 to 1.0, or `None` when
-    /// the message belongs to an earlier recording.
+    /// Returns the level of the new audio in dB (see `level_db`), or `None`
+    /// when the message belongs to an earlier recording.
     pub fn on_data(&mut self, header: *const WAVEHDR) -> Option<f32> {
         let index = self
             .buffers
@@ -157,7 +157,7 @@ impl Recorder {
             return None;
         }
         self.queued.remove(place);
-        let peak = self.collect(index);
+        let level = self.collect(index);
 
         if self.samples.len() < MAX_SAMPLES {
             let header = &raw mut self.buffers[index].header;
@@ -166,17 +166,16 @@ impl Recorder {
                 self.queued.push_back(index);
             }
         }
-        Some(peak)
+        Some(level)
     }
 
-    /// Append what the driver wrote into buffer `index`; returns its peak.
+    /// Append what the driver wrote into buffer `index`; returns its level.
     fn collect(&mut self, index: usize) -> f32 {
         let buffer = &self.buffers[index];
         let recorded = { buffer.header.dwBytesRecorded } as usize / 2;
         let chunk = &buffer.data[..recorded.min(buffer.data.len())];
-        let peak = chunk.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
         self.samples.extend_from_slice(chunk);
-        peak as f32 / 32768.0
+        level_db(chunk)
     }
 
     /// Stop and return everything recorded, including the audio still
@@ -208,9 +207,38 @@ impl Drop for Recorder {
     }
 }
 
-/// Loudest sample of a recording, 0.0 to 1.0.
-pub fn peak(samples: &[i16]) -> f32 {
-    samples.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0) as f32 / 32768.0
+/// What `level_db` reports for digital silence.
+pub const SILENT_DB: f32 = -120.0;
+
+/// Loudness of `samples` in decibels relative to full scale: the RMS level,
+/// 0 for the loudest possible signal, about -20 for speech close to the
+/// microphone, -60 and below for the noise of a quiet input.
+pub fn level_db(samples: &[i16]) -> f32 {
+    if samples.is_empty() {
+        return SILENT_DB;
+    }
+    let energy: f64 = samples.iter().map(|&s| (s as f64) * (s as f64)).sum();
+    let rms = (energy / samples.len() as f64).sqrt() / 32768.0;
+    if rms <= 0.0 {
+        return SILENT_DB;
+    }
+    (20.0 * rms.log10()).max(SILENT_DB as f64) as f32
+}
+
+/// The level a recording reached for at least 0.2 seconds in total: the
+/// fourth loudest of its 50 ms stretches.
+///
+/// This is what tells speech from an input that delivers nothing. A whole
+/// recording's average would be dragged down by pauses, and its peak would
+/// be fooled by a single click, such as the key that stopped the recording.
+pub fn speech_level_db(samples: &[i16]) -> f32 {
+    let mut levels: Vec<f32> = samples.chunks(BUFFER_SAMPLES).map(level_db).collect();
+    levels.sort_by(|a, b| b.total_cmp(a));
+    levels
+        .get(3)
+        .or(levels.last())
+        .copied()
+        .unwrap_or(SILENT_DB)
 }
 
 /// A complete 16-bit mono WAV file for `samples`.
@@ -356,9 +384,50 @@ mod tests {
         assert!(decode_wav(b"RIFF\0\0\0\0WAVE").is_err());
     }
 
+    /// A 440 Hz tone with the given peak amplitude.
+    fn tone(amplitude: f64, samples: usize) -> Vec<i16> {
+        (0..samples)
+            .map(|i| {
+                let phase = i as f64 * 440.0 * std::f64::consts::TAU / SAMPLE_RATE as f64;
+                (amplitude * phase.sin()) as i16
+            })
+            .collect()
+    }
+
     #[test]
-    fn peak_is_relative_to_full_scale() {
-        assert_eq!(peak(&[]), 0.0);
-        assert_eq!(peak(&[0, -16384, 100]), 0.5);
+    fn level_is_in_decibels_below_full_scale() {
+        assert_eq!(level_db(&[]), SILENT_DB);
+        assert_eq!(level_db(&[0; 800]), SILENT_DB);
+        // A full-scale square wave is 0 dB.
+        let square: Vec<i16> = (0..800)
+            .map(|i| if i % 2 == 0 { 32767 } else { -32767 })
+            .collect();
+        assert!(level_db(&square).abs() < 0.01);
+        // A sine is 3 dB below its peak: amplitude 0.1 gives -23 dB.
+        let level = level_db(&tone(3276.8, 16000));
+        assert!((level + 23.0).abs() < 0.1, "{level}");
+    }
+
+    #[test]
+    fn speech_level_ignores_pauses_and_clicks() {
+        let quiet = tone(10.0, 16000); // about -73 dB
+        let speech = tone(3276.8, 8000); // half a second at -23 dB
+
+        // Two seconds of near silence around half a second of speech.
+        let mut recording = quiet.clone();
+        recording.extend(&speech);
+        recording.extend(&quiet);
+        let level = speech_level_db(&recording);
+        assert!((level + 23.0).abs() < 0.5, "{level}");
+
+        // Near silence with one loud click of 25 ms: still near silence.
+        let mut clicked = quiet.clone();
+        clicked.extend(tone(30000.0, 400));
+        clicked.extend(&quiet);
+        let level = speech_level_db(&clicked);
+        assert!(level < -70.0, "{level}");
+
+        assert_eq!(speech_level_db(&[]), SILENT_DB);
+        assert_eq!(speech_level_db(&[0; 16000]), SILENT_DB);
     }
 }

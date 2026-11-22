@@ -1,6 +1,6 @@
 [package]
 name = "saydrop"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Dictate into any Windows app: press a hotkey, speak, and the text is pasted. Uses your own speech-to-text server."
 license = "MIT"

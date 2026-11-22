@@ -43,6 +43,9 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 const TIMER_ID: usize = 1;
 const FRAME_MS: u32 = 50;
 const BARS: usize = 24;
+/// The level that fills the meter. Speech peaks well above its average, so
+/// an average of -10 dB is already very loud.
+const METER_TOP_DB: f32 = -10.0;
 /// The countdown replaces the clock this many seconds before the limit.
 const WARN_SECONDS: u64 = 30;
 
@@ -71,6 +74,9 @@ struct Overlay {
     phase: Phase,
     started: u64,
     max_seconds: u32,
+    /// Input below this level leaves the meter flat: it is what the silence
+    /// check treats as "nothing there".
+    floor_db: f32,
     /// Recent input levels, oldest first, each 0.0 to 1.0.
     levels: [f32; BARS],
     font: HFONT,
@@ -113,7 +119,7 @@ pub fn register_class(instance: *mut c_void) -> bool {
 }
 
 /// Lay the bar out for a display of `dpi`, measuring text with `dc`.
-fn build(dc: HDC, dpi: i32, owner: HWND, phase: Phase, max_seconds: u32) -> Overlay {
+fn build(dc: HDC, dpi: i32, owner: HWND, phase: Phase, max_seconds: u32, floor_db: f32) -> Overlay {
     let scale = |value: i32| value * dpi / 96;
 
     let text_font = font(scale(14), 600);
@@ -138,6 +144,7 @@ fn build(dc: HDC, dpi: i32, owner: HWND, phase: Phase, max_seconds: u32) -> Over
         phase,
         started: tick(),
         max_seconds,
+        floor_db,
         levels: [0.0; BARS],
         font: text_font,
         dpi,
@@ -161,8 +168,16 @@ fn build(dc: HDC, dpi: i32, owner: HWND, phase: Phase, max_seconds: u32) -> Over
 }
 
 /// Show the bar in `phase` on the monitor containing `anchor`. Clicks on its
-/// buttons are posted to `owner`. `max_seconds` of 0 means no limit.
-pub fn show(instance: *mut c_void, owner: HWND, anchor: POINT, phase: Phase, max_seconds: u32) {
+/// buttons are posted to `owner`. `max_seconds` of 0 means no limit; input
+/// quieter than `floor_db` leaves the meter flat.
+pub fn show(
+    instance: *mut c_void,
+    owner: HWND,
+    anchor: POINT,
+    phase: Phase,
+    max_seconds: u32,
+    floor_db: f32,
+) {
     hide();
 
     // SAFETY: Win32/GDI calls with valid arguments; the font ends up owned
@@ -179,7 +194,7 @@ pub fn show(instance: *mut c_void, owner: HWND, anchor: POINT, phase: Phase, max
             dpi_x = 96;
         }
         let screen = GetDC(null_mut());
-        let overlay = build(screen, dpi_x as i32, owner, phase, max_seconds);
+        let overlay = build(screen, dpi_x as i32, owner, phase, max_seconds, floor_db);
         ReleaseDC(null_mut(), screen);
         let (width, height) = (overlay.width, overlay.height);
 
@@ -229,21 +244,21 @@ pub fn set_phase(phase: Phase) {
     }
 }
 
-/// Feed the meter with the peak level (0.0 to 1.0) of the newest audio.
-pub fn push_level(peak: f32) {
+/// Feed the meter with the level in dB of the newest audio.
+pub fn push_level(level_db: f32) {
     if let Some(overlay) = OVERLAY.get() {
         overlay.levels.copy_within(1.., 0);
-        overlay.levels[BARS - 1] = meter_level(peak);
+        overlay.levels[BARS - 1] = meter_level(level_db, overlay.floor_db);
     }
 }
 
-/// Map a linear peak to bar height: -50 dB and below is empty, 0 dB is full.
-/// A linear meter would hardly move for normal speech.
-fn meter_level(peak: f32) -> f32 {
-    if peak <= 0.0 {
-        return 0.0;
-    }
-    ((20.0 * peak.log10() + 50.0) / 50.0).clamp(0.0, 1.0)
+/// Map a level in dB to bar height: `floor_db` and below is empty,
+/// `METER_TOP_DB` is full. Working in decibels keeps the meter lively; a
+/// linear one would hardly move for normal speech.
+fn meter_level(level_db: f32, floor_db: f32) -> f32 {
+    // A floor at or above the top would leave no range to show.
+    let floor = floor_db.min(METER_TOP_DB - 10.0);
+    ((level_db - floor) / (METER_TOP_DB - floor)).clamp(0.0, 1.0)
 }
 
 pub fn hide() {
@@ -585,12 +600,20 @@ mod tests {
     }
 
     #[test]
-    fn meter_is_logarithmic() {
-        assert_eq!(meter_level(0.0), 0.0);
-        assert_eq!(meter_level(1.0), 1.0);
-        assert_eq!(meter_level(0.001), 0.0);
-        let speech = meter_level(0.1);
-        assert!((0.55..0.65).contains(&speech), "{speech}");
+    fn meter_spans_the_floor_to_loud_speech() {
+        assert_eq!(meter_level(-120.0, -50.0), 0.0);
+        assert_eq!(meter_level(-50.0, -50.0), 0.0);
+        assert_eq!(meter_level(-10.0, -50.0), 1.0);
+        assert_eq!(meter_level(0.0, -50.0), 1.0);
+        assert_eq!(meter_level(-30.0, -50.0), 0.5);
+        // A lower floor shows quieter input.
+        assert!(meter_level(-55.0, -60.0) > 0.0);
+        // With the check switched off there is still a usable range.
+        assert_eq!(meter_level(-120.0, -120.0), 0.0);
+        assert!(meter_level(-30.0, -120.0) > 0.5);
+        // A nonsensical floor cannot divide by zero.
+        assert_eq!(meter_level(-25.0, 0.0), 0.0);
+        assert_eq!(meter_level(-15.0, 0.0), 0.5);
     }
 
     /// Writes pictures of the bar when SAYDROP_PREVIEW_DIR is set.
@@ -607,7 +630,7 @@ mod tests {
         for dpi in [96, 144] {
             for (name, phase, elapsed, hover) in samples {
                 let mut overlay =
-                    preview::with_measure_dc(|dc| build(dc, dpi, null_mut(), phase, 240));
+                    preview::with_measure_dc(|dc| build(dc, dpi, null_mut(), phase, 240, -50.0));
                 overlay.started = tick().saturating_sub(elapsed * 1000);
                 overlay.hover = hover;
                 for (index, level) in overlay.levels.iter_mut().enumerate() {

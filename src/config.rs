@@ -23,6 +23,7 @@ const DEFAULT_PASTE_KEYS: &str = "Ctrl+V";
 const DEFAULT_ASR_URL: &str = "http://127.0.0.1:8020";
 const DEFAULT_ASR_MODEL: &str = "whisper-1";
 const DEFAULT_MAX_SECONDS: u32 = 240;
+const DEFAULT_SILENCE_DB: f32 = -50.0;
 const DEFAULT_ASR_TIMEOUT: u32 = 120;
 const DEFAULT_LLM_TIMEOUT: u32 = 60;
 
@@ -71,6 +72,13 @@ max_seconds = 240
 
 # Microphone name as listed in the tray menu. Empty = the Windows default.
 microphone =
+
+# A recording in which nothing gets louder than this is not sent. With a muted
+# or wrong microphone, some speech models invent text out of the silence.
+# The value is in decibels below full scale: normal speech reaches -30 to -10,
+# an input with nothing on it stays below -60. Lower it (for example -60) if
+# quiet speech is rejected; -120 switches the check off.
+silence_db = -50
 
 # ---- Cleanup by a language model (optional) --------------------------------
 # When on, the transcript goes through a chat model that fixes punctuation and
@@ -144,6 +152,8 @@ pub struct Config {
     pub glossary: String,
     pub max_seconds: u32,
     pub microphone: String,
+    /// Recordings that never get louder than this are not sent.
+    pub silence_db: f32,
 
     pub llm: bool,
     pub llm_url: String,
@@ -364,6 +374,7 @@ pub fn parse(text: &str, warnings: &mut Vec<String>) -> Config {
         glossary: String::new(),
         max_seconds: DEFAULT_MAX_SECONDS,
         microphone: String::new(),
+        silence_db: DEFAULT_SILENCE_DB,
         llm: false,
         llm_url: String::new(),
         llm_model: String::new(),
@@ -406,6 +417,13 @@ pub fn parse(text: &str, warnings: &mut Vec<String>) -> Config {
             "glossary" => config.glossary = value,
             "max_seconds" => number(&mut config.max_seconds),
             "microphone" => config.microphone = value,
+            "silence_db" => match value.parse::<f32>() {
+                Ok(db) if db <= 0.0 => config.silence_db = db.max(-120.0),
+                Ok(_) => warnings.push(format!(
+                    "silence_db must be zero or negative, for example -50, not: {value}"
+                )),
+                Err(_) => warnings.push(format!("silence_db is not a number: {value}")),
+            },
             "llm" => match parse_switch(&value) {
                 Some(on) => config.llm = on,
                 None => warnings.push(format!("llm must be on or off, not: {value}")),
@@ -668,6 +686,7 @@ mod tests {
         assert_eq!(c.cancel[0].text, "Esc");
         assert_eq!(c.asr_url, "http://127.0.0.1:8020");
         assert_eq!(c.max_seconds, 240);
+        assert_eq!(c.silence_db, -50.0);
         assert!(!c.llm && c.paste && !c.append_space);
         assert_eq!(c.paste_keys_text, "Ctrl+V");
         assert!(c.llm_extra.is_empty());
@@ -734,6 +753,21 @@ mod tests {
         assert_eq!(c.start[0].text, "F13");
         assert_eq!(c.stop[0].text, "F14");
         assert_eq!(c.main_hotkey(), "Insert");
+    }
+
+    #[test]
+    fn silence_threshold_is_a_negative_level() {
+        let parse_one = |text: &str| {
+            let mut warnings = Vec::new();
+            let config = parse(text, &mut warnings);
+            (config.silence_db, warnings.len())
+        };
+        assert_eq!(parse_one("silence_db = -60"), (-60.0, 0));
+        assert_eq!(parse_one("silence_db = -42.5"), (-42.5, 0));
+        assert_eq!(parse_one("silence_db = -500"), (-120.0, 0));
+        // A missing sign or a word keeps the default and says so.
+        assert_eq!(parse_one("silence_db = 50"), (-50.0, 1));
+        assert_eq!(parse_one("silence_db = quiet"), (-50.0, 1));
     }
 
     #[test]
